@@ -1,33 +1,44 @@
 import json
 import os
+import time
+import pyaudio
+import wave
+import numpy as np
+import datetime 
+
 from src.modules.nlp_core import LLMConnector
+from src.modules.stt import STTConnector
+from src.modules.tts import TTSConnector
+from src.modules.rag import RAGSystem
+from pydub import AudioSegment
+
 
 print("DEBUG: Script started.")
 
 # --- Configuration and Data Loading ---
-# More robust way to find project root:
 current_path = os.path.dirname(os.path.abspath(__file__))
 project_root = current_path
-# Traverse upwards until the project root directory "Veena_AI_CHatbot" is found
-# IMPORTANT: Adjust "Veena_AI_CHatbot" if your actual root folder name is different.
-project_root_name = "Veena_AI_CHatbot" # <<< IMPORTANT: Adjust this if your root folder has a different name
+project_root_name = "Veena_AI_CHatbot"
 while os.path.basename(project_root) != project_root_name and project_root != os.path.dirname(project_root):
     project_root = os.path.dirname(project_root)
-# Fallback if the specific project_root_name is not found (e.g., if you run from a sub-sub-directory)
-# and ensure it doesn't go above the drive root.
 if os.path.basename(project_root) != project_root_name and os.path.dirname(project_root) != project_root:
     print(f"WARNING: Could not find project root '{project_root_name}' directly. Falling back to two levels up from script.")
     project_root = os.path.dirname(os.path.dirname(current_path))
-elif os.path.basename(project_root) != project_root_name and os.path.dirname(project_root) == project_root: # It's at drive root but name doesn't match
+elif os.path.basename(project_root) != project_root_name and os.path.dirname(project_root) == project_root:
      print(f"WARNING: Reached drive root. Assuming '{current_path}' is relative to project root directly if '{project_root_name}' is not found.")
-     project_root = os.path.dirname(os.path.dirname(current_path)) # Re-apply two levels up for safety
+     project_root = os.path.dirname(os.path.dirname(current_path))
 
 
 BASE_DIR = project_root
 PROCESSED_DATA_DIR = os.path.join(BASE_DIR, 'data', 'processed')
+LOGS_DIR = os.path.join(BASE_DIR, 'logs') 
+
+# Ensure logs directory exists
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 print(f"DEBUG: Calculated BASE_DIR is {BASE_DIR}")
 print(f"DEBUG: Calculated PROCESSED_DATA_DIR is {PROCESSED_DATA_DIR}")
+print(f"DEBUG: Logs will be saved to {LOGS_DIR}")
 
 try:
     print("DEBUG: Attempting to load conversation_script.json")
@@ -58,14 +69,22 @@ print("✅ Data loading complete. Initializing VeenaBot...\n")
 class VeenaBot:
     def __init__(self, script, kb, customer_data):
         self.script = script
-        self.kb = kb # knowledge_base is passed as kb for consistency
+        self.kb = kb
         self.customer_data = customer_data
-        self.current_branch = "Branch 1.0 - Initial Greeting" # Correct initial branch name as per your script
+        self.current_branch = "Branch 1.0 - Initial Greeting"
         self.conversation_history = []
         self.policy_holder_name = customer_data.get("policy_holder_name", "Sir/Madam")
-        self.llm = LLMConnector() # Initialize LLM connector (model selection handled internally)
+        self.llm = LLMConnector()
+        self.stt = STTConnector(model_size="base")
+        self.tts = TTSConnector()
+        self.rag = RAGSystem()
 
-        # LLM Role and Instructions (System Prompt / Context for the LLM)
+        self.sample_rate = 16000
+        self.channels = 1
+        self.record_duration = 30 # seconds
+        self.chunk_size = 1024
+        self.audio_input_filename = os.path.join(LOGS_DIR, "customer_input_temp.wav") 
+
         self.llm_system_prompt = (
             "You are 'Veena,' a friendly, helpful, and professional insurance agent for 'ValuEnable life insurance'. "
             "Your primary goal is to remind and convince customers to pay their premiums, provide policy information, "
@@ -77,16 +96,30 @@ class VeenaBot:
             "Do not invent information outside of the provided context. "
             "If asked to converse in Hindi, Marathi, or Gujarati, acknowledge the request, state that you will switch languages, and continue the conversation in that language."
         )
-        self.llm_current_context = "" # Will build up context for the LLM based on current branch
+        self.llm_current_context = ""
+
+        # Log file setup
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_filepath = os.path.join(LOGS_DIR, f"conversation_log_{timestamp}.txt")
+        self._write_log("--- NEW CONVERSATION START ---")
+        self._write_log(f"Session Timestamp: {timestamp}")
+        self._write_log(f"Initial Bot Role: {self.llm_system_prompt[:100]}...")
+        self._write_log(f"Customer Policy Data: {json.dumps(self.customer_data)}")
+
+
+    def _write_log(self, message):
+        """Appends a message to the conversation log file."""
+        with open(self.log_filepath, 'a', encoding='utf-8') as f:
+            f.write(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}\n")
 
     def _format_agent_line(self, line):
-        """Replaces placeholders in agent lines with actual customer data."""
         return line.format(
             policy_holder_name=self.policy_holder_name,
             product_name=self.customer_data.get("product_name"),
             policy_number=self.customer_data.get("policy_number"),
             policy_start_date=self.customer_data.get("policy_start_date"),
             total_premium_paid=self.customer_data.get("total_premium_paid"),
+            data_transfer_mode=self.customer_data.get("data_transfer_mode"), 
             outstanding_amount=self.customer_data.get("outstanding_amount"),
             premium_due_date=self.customer_data.get("premium_due_date"),
             sum_assured=self.customer_data.get("sum_assured"),
@@ -94,7 +127,6 @@ class VeenaBot:
         )
 
     def _get_branch_specific_llm_context(self):
-        """Generates context for the LLM based on the current branch and KB/customer data."""
         context = ""
         if self.current_branch == "Branch 2.0 - Policy Confirmation":
             context += (
@@ -104,51 +136,43 @@ class VeenaBot:
                 f"Outstanding premium {self.customer_data.get('outstanding_amount')} due on {self.customer_data.get('premium_due_date')}. "
                 f"Policy status: Discontinuance with no life insurance cover. "
             )
-        elif self.current_branch == "Branch 8.0 - Rebuttals":
-            context += "\nHere are some common rebuttals for insurance policy renewal objections:\n"
-            for rebuttal_scenario in self.kb["scenario_based_rebuttals"]:
-                context += f"Scenario: {rebuttal_scenario['scenario']}\n"
-                for rebuttal_point in rebuttal_scenario['rebuttals']:
-                    context += f"- {self._format_agent_line(rebuttal_point)}\n" # Format rebuttals with policy data
-            context += (
-                f"Current policy's Sum Assured: {self.customer_data.get('sum_assured')}. "
-                f"Estimated Fund Value at maturity: {self.customer_data.get('fund_value')}. "
-                f"Loyalty Benefits: {self.kb['policy_details']['Loyalty Benefits']}. "
-                f"Effective Returns: {self.kb['policy_details']['Effective Returns']}. "
-                f"Charges: {self.kb['policy_details']['Charges']}. "
-                f"Tax benefits under Sec 80(c), 10 (10(D)). "
-            )
-            context += "\nGeneral Financial Information:\n"
-            context += json.dumps(self.kb["other_financial_info"]) + "\n"
-            context += json.dumps(self.kb["growth_scenarios"]) + "\n"
         
-        # Add a note about language if multilingual support is enabled
         if any(lang in " ".join(self.conversation_history[-2:]).lower() for lang in ["hindi", "marathi", "gujarati"]):
             context += "The customer has requested to converse in a different language. Acknowledge this and prepare to switch."
 
         return context
 
     def get_agent_response_llm_enhanced(self):
-        """
-        Generates Veena's response using the LLM, incorporating scripted lines and context.
-        """
         branch_info = self.script["branches"].get(self.current_branch)
         if not branch_info:
             return "I'm sorry, I've lost track of the conversation. Let's start over."
 
         scripted_lines = [self._format_agent_line(line) for line in branch_info["agent_lines"]]
         
-        # Build prompt for LLM to generate response
+        retrieved_rag_context = ""
+        last_user_utterance = self.conversation_history[-1] if self.conversation_history else ""
+        
+        if last_user_utterance and "no clear speech detected" not in last_user_utterance.lower():
+            query_for_rag = last_user_utterance.replace("You: ", "").strip()
+            if query_for_rag:
+                retrieved_docs = self.rag.retrieve_documents(query_for_rag, k=3)
+                if retrieved_docs:
+                    retrieved_rag_context = "\nRelevant information from knowledge base:\n"
+                    for doc in retrieved_docs:
+                        retrieved_rag_context += f"- {doc.page_content}\n"
+
+
         prompt_for_response_generation = (
             f"{self.llm_system_prompt}\n\n"
             f"Current conversation branch: '{self.current_branch}'.\n"
             f"Your previous response was: {self.conversation_history[-1] if self.conversation_history else 'None'}\n"
             f"Customer's last input: {self.conversation_history[-2] if len(self.conversation_history) >= 2 else 'None'}\n"
-            f"Scripted lines for this turn: {json.dumps(scripted_lines)}\n" # Provide exact lines to be covered
-            f"{self._get_branch_specific_llm_context()}\n\n" # Add relevant KB/policy context (RAG)
-            f"Please generate Veena's next response based on the script, incorporating the scripted lines naturally. "
+            f"Scripted lines for this turn: {json.dumps(scripted_lines)}\n"
+            f"{self._get_branch_specific_llm_context()}\n"
+            f"{retrieved_rag_context}"
+            f"\n\nPlease generate Veena's next response based on the script, incorporating the scripted lines naturally. "
+            f"Use the 'Relevant information from knowledge base' if it helps answer questions or handle objections. "
             f"Keep it concise (under 35 words), in simple English, and end with a question unless concluding. "
-            f"If handling objections (Branch 8.0), integrate the relevant rebuttal points naturally into your response. "
             f"Do not just list the scripted lines; make it sound like a fluid conversation. "
             f"Output only Veena's response."
         )
@@ -156,22 +180,110 @@ class VeenaBot:
         llm_response = self.llm.get_llm_response(prompt_for_response_generation)
         return llm_response
 
+    def _record_audio(self):
+        print(f"👂 Recording for {self.record_duration} seconds... (Speak now)")
+        
+        audio = pyaudio.PyAudio()
+        
+        input_device_index = None
+        try:
+            default_info = audio.get_default_input_device_info()
+            if default_info['maxInputChannels'] > 0:
+                input_device_index = default_info['index']
+                print(f"DEBUG: Using default input device '{default_info['name']}' at index {input_device_index}")
+            else:
+                print("DEBUG: Default input device has no input channels. Searching for alternative.")
+        except Exception:
+            print("DEBUG: No default input device found. Searching for any suitable input device.")
+
+        if input_device_index is None:
+            for i in range(audio.get_device_count()):
+                dev_info = audio.get_device_info_by_index(i)
+                if dev_info['maxInputChannels'] > 0:
+                    if 'realme Buds Air 2' in dev_info['name']:
+                        input_device_index = dev_info['index']
+                        print(f"DEBUG: Found specific microphone '{dev_info['name']}' at index {input_device_index}")
+                        break
+                    if input_device_index is None:
+                        input_device_index = dev_info['index']
+                        print(f"DEBUG: Using first found input device '{dev_info['name']}' at index {input_device_index}")
+
+        if input_device_index is None:
+            print("ERROR: No suitable microphone input device found. Please check microphone setup in Windows.")
+            audio.terminate()
+            return None
+
+        stream = audio.open(format=pyaudio.paInt16,
+                            channels=self.channels,
+                            rate=self.sample_rate,
+                            input=True,
+                            frames_per_buffer=self.chunk_size,
+                            input_device_index=input_device_index
+                            )
+        
+        frames = []
+        num_frames = int(self.sample_rate / self.chunk_size * self.record_duration)
+        for _ in range(0, num_frames):
+            try:
+                data = stream.read(self.chunk_size)
+                frames.append(data)
+            except IOError as e:
+                print(f"ERROR: PyAudio stream read error: {e}. This often means microphone disconnected or unreadable.")
+                break
+        
+        print("✅ Recording finished.")
+        
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
+        
+        if not frames:
+            print("WARNING: No audio frames recorded. Transcription will be empty.")
+            return None
+            
+        wf = wave.open(self.audio_input_filename, 'wb')
+        wf.setnchannels(self.channels)
+        wf.setsampwidth(audio.get_sample_size(pyaudio.paInt16)) 
+        wf.setframerate(self.sample_rate)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        
+        return self.audio_input_filename
+
+    def _play_beep_cue(self, duration_ms=100, frequency=1000):
+        try:
+            sample_rate = self.sample_rate
+            t = np.linspace(0, duration_ms / 1000, int(sample_rate * duration_ms / 1000), endpoint=False)
+            data = np.sin(2 * np.pi * frequency * t) * 0.2
+            data_int16 = (data * (2**15 - 1)).astype(np.int16).tobytes()
+
+            p = pyaudio.PyAudio()
+            stream = p.open(format=pyaudio.paInt16,
+                            channels=self.channels,
+                            rate=sample_rate,
+                            output=True)
+            
+            stream.write(data_int16)
+            
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+        except Exception as e:
+            print(f"WARNING: Could not play beep cue: {e}. Check audio output or PyAudio setup.")
+
+
     def _determine_next_branch_with_llm(self, customer_input):
-        """
-        Uses LLM to interpret customer intent and determine the next branch.
-        """
         current_branch_info = self.script["branches"].get(self.current_branch)
         if not current_branch_info:
             print("(LLM Transition Debug: Current branch info not found. Defaulting to closure.)")
             return "Branch 9.0 - Conversation Closure"
 
-        # Dynamically get possible transitions from the script structure
         possible_transitions_and_goals = {}
         if "transitions" in current_branch_info:
             for key, value in current_branch_info["transitions"].items():
-                if isinstance(value, str): # Direct branch name
+                if isinstance(value, str):
                     possible_transitions_and_goals[key] = f"Transition directly to {value}"
-                elif isinstance(value, dict): # Nested transitions
+                elif isinstance(value, dict):
                     if "agent_lines" in value:
                         possible_transitions_and_goals[key] = f"Veena says: '{value['agent_lines'][0]}' then transitions based on customer's response."
                         if "next_branches" in value:
@@ -179,13 +291,12 @@ class VeenaBot:
                                 possible_transitions_and_goals[f"{key} -> {nested_key}"] = f"If customer says '{nested_key}', transition to {nested_branch}."
                         elif "next_branch" in value:
                              possible_transitions_and_goals[key] += f" Then transition to {value['next_branch']}."
-                    elif "next_branches" in value: # Direct next_branches without intermediate agent lines
+                    elif "next_branches" in value:
                         for nested_key, nested_branch in value["next_branches"].items():
                             possible_transitions_and_goals[nested_key] = f"If customer says '{nested_key}', transition to {nested_branch}."
-                    elif "next_branch" in value: # Direct next_branch in a dict
+                    elif "next_branch" in value:
                          possible_transitions_and_goals[key] = f"Transition directly to {value['next_branch']}."
 
-        # Add explicit next_branch if it exists and is not already implicitly covered
         direct_next = current_branch_info.get("next_branch")
         if direct_next and direct_next not in possible_transitions_and_goals.values():
              possible_transitions_and_goals["(Direct Next Branch)"] = f"Default transition to {direct_next} if no specific intent is detected."
@@ -193,7 +304,7 @@ class VeenaBot:
         prompt_template = (
             f"{self.llm_system_prompt}\n\n"
             f"Current conversation history:\n"
-            f"{' '.join(self.conversation_history[-3:])}\n" # Last 3 turns for context
+            f"{' '.join(self.conversation_history[-3:])}\n"
             f"You are currently in the '{self.current_branch}' branch. "
             f"The primary goal of the '{self.current_branch}' branch is: {current_branch_info.get('description', 'to guide the conversation.')}\n\n"
             f"The customer just said: \"{customer_input}\"\n\n"
@@ -202,14 +313,12 @@ class VeenaBot:
             f"Prioritize direct transitions defined for the '{self.current_branch}' branch. "
             f"Do NOT skip intermediate steps unless the customer's input explicitly and directly matches an intent for a later branch. "
             f"Here are the specific, EXACT branch names from the script you can transition to: \n"
-            f"{json.dumps(list(self.script['branches'].keys()))}\n\n" # Provide all valid branch names
+            f"{json.dumps(list(self.script['branches'].keys()))}\n\n"
             f"Consider these possible transitions from the '{self.current_branch}' branch:\n"
-            f"{json.dumps(possible_transitions_and_goals, indent=2)}\n\n" # Explicit transitions for current branch with goals
+            f"{json.dumps(possible_transitions_and_goals, indent=2)}\n\n"
             
-            # --- Specific Instruction for Branch 1.0 (to fix immediate 'yes' -> Branch 2.0 issue) ---
             f"If currently in 'Branch 1.0 - Initial Greeting' and customer says 'yes' or confirms readiness to speak, "
-            f"the next branch MUST be 'Branch 2.0 - Policy Confirmation'.\n" # Reinforced instruction
-            # --- End Specific Instruction ---
+            f"the next branch MUST be 'Branch 2.0 - Policy Confirmation'.\n"
 
             f"If the customer explicitly indicates they 'already paid', select 'Branch 6.0 - Payment Already Made'. "
             f"If the customer explicitly mentions 'financial problem', select 'Branch 7.0 - Financial problem'. "
@@ -222,61 +331,76 @@ class VeenaBot:
         )
 
         llm_decision = self.llm.get_llm_response(prompt_template, max_tokens=100).strip()
-        print(f"(LLM Decided Transition: {llm_decision})") # For debugging
+        print(f"(LLM Decided Transition: {llm_decision})")
 
-        # Validate LLM's suggested branch against actual script branches
         if llm_decision in self.script["branches"]:
             return llm_decision
         
-        # Robust check for common partial matches if LLM output isn't exact
         llm_decision_lower = llm_decision.lower()
         for branch_key in self.script["branches"].keys():
-            if branch_key.lower() == llm_decision_lower: # Exact match for lower case variations
+            normalized_key = branch_key.lower().replace(" - ", " ").replace("-", " ")
+            if normalized_key == llm_decision_lower:
                 return branch_key
-            # Try matching common parts of the branch name if not exact (more flexible)
-            # This helps catch cases like LLM saying "Policy Confirmation" instead of "Branch 2.0 - Policy Confirmation"
-            if "branch 2.0" in llm_decision_lower and "policy confirmation" in llm_decision_lower and "Branch 2.0 - Policy Confirmation" == branch_key:
+            if normalized_key in llm_decision_lower:
                 return branch_key
-            if "branch 3.0" in llm_decision_lower and "arrange call back" in llm_decision_lower and "Branch 3.0 - Arrange call back if customer is busy" == branch_key:
-                return branch_key
-            if "branch 5.0" in llm_decision_lower and "payment follow-up" in llm_decision_lower and "Branch 5.0 - Payment Follow-up" == branch_key:
-                return branch_key
-            if "branch 8.0" in llm_decision_lower and "rebuttals" in llm_decision_lower and "Branch 8.0 - Rebuttals" == branch_key:
-                return branch_key
-            if "branch 9.0" in llm_decision_lower and ("closure" in llm_decision_lower or "end call" in llm_decision_lower) and "Branch 9.0 - Conversation Closure" == branch_key:
-                return branch_key
-            
+
         print(f"(LLM provided an unclear/invalid branch name: '{llm_decision}'. Attempting to find a closest match or staying in current branch.)")
         
-        # Fallback to direct next_branch if it exists in the script and LLM is uncertain
         if direct_next and direct_next in self.script["branches"]:
             print(f"(Falling back to script's direct next_branch: {direct_next})")
             return direct_next
         
-        # Final fallback: stay in the current branch. This might mean the user needs to clarify.
         return self.current_branch
 
     def start_conversation(self):
-        print("\n--- Starting Veena AI Assistant (Text-Only Prototype with LLM) ---")
-        print(self.script["role"])
+        print("\n--- Starting Veena AI Assistant (Voice-Enabled Prototype with LLM) ---")
+        self.tts.synthesize_speech(self.script["role"], lang='en', play_audio=True)
+        time.sleep(3) # Longer pause after speaking the role
 
         while self.current_branch != "END_CALL":
-            # Generate and print Veena's response
             llm_generated_response = self.get_agent_response_llm_enhanced()
-            print(f"Veena: {llm_generated_response}")
+            print(f"Veena (Text): {llm_generated_response}")
             self.conversation_history.append(f"Veena: {llm_generated_response}")
+            
+            current_lang = 'en'
+            last_user_input = self.conversation_history[-1].lower() if self.conversation_history else ""
+            if "hindi" in last_user_input or "hindi" in " ".join([h.lower() for h in self.conversation_history[-3:]]):
+                current_lang = 'hi'
+            elif "marathi" in last_user_input or "marathi" in " ".join([h.lower() for h in self.conversation_history[-3:]]): 
+                current_lang = 'mr'
+            elif "gujarati" in last_user_input or "gujarati" in " ".join([h.lower() for h in self.conversation_history[-3:]]):
+                current_lang = 'gu'
+                
+            self.tts.synthesize_speech(llm_generated_response, lang=current_lang, play_audio=True)
+            time.sleep(3) 
 
-            # IMMEDIATE CHECK FOR CLOSURE: If the response was from the closure branch, terminate.
-            # This ensures the bot doesn't ask for user input again after saying goodbye.
             if self.current_branch == "Branch 9.0 - Conversation Closure":
-                self.current_branch = "END_CALL" # Set to special END_CALL state
-                break # Exit the loop immediately
+                self.current_branch = "END_CALL"
+                break
 
-            # If not a closure branch, get customer input and determine next transition
-            customer_input = input("You: ")
+            print("--- Please speak now ---")
+            self._play_beep_cue()
+            time.sleep(0.1)
+
+            recorded_audio_path = self._record_audio()
+            
+            if recorded_audio_path is None:
+                customer_input = "No clear speech detected. Microphone error during recording."
+                print("You (Speech - Recording Error): (Microphone error occurred)")
+            else:
+                customer_input = self.stt.transcribe_audio(recorded_audio_path)
+                
+                if customer_input is None or customer_input.strip() == "":
+                    print("You (Speech - No input/detected): (Silence or no clear speech)")
+                    customer_input = "No clear speech detected. Please speak clearly into the microphone."
+                else:
+                    print(f"You (Speech): {customer_input}")
+                
+                if os.path.exists(recorded_audio_path):
+                    os.remove(recorded_audio_path)
+            
             self.conversation_history.append(f"You: {customer_input}")
             
-            # Use LLM to transition to the next branch
             self.current_branch = self._determine_next_branch_with_llm(customer_input)
 
         print("\n--- Conversation Ended ---")
@@ -284,7 +408,5 @@ class VeenaBot:
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Ensure these variable names (conversation_script, knowledge_base, customer_policy_data)
-    # match what's loaded from your JSON files and passed to VeenaBot.
     veena_bot = VeenaBot(conversation_script, knowledge_base, customer_policy_data)
     veena_bot.start_conversation()

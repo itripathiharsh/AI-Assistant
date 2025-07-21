@@ -1,2 +1,17 @@
 google-generativeai
 python-dotenv
+faster-whisper
+gTTS
+pydub   
+PyAudio    
+numpy       
+sounddevice
+soundfile
+mysqlclient
+chromadb
+langchain
+langchain-google-genai 
+sentence-transformers
+pypdf 
+streamlit
+streamlit-audio-recorder
