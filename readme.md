@@ -32,24 +32,23 @@ This assistant is designed for **ValuEnable Life Insurance** to:
 ## 🗃️ Project Structure
 
 Veena_AI_Chatbot/
-├── app.py # Streamlit interface
+├── app.py                        # Streamlit interface for chatbot UI
 ├── src/
-│ ├── prototype_text_only_bot.py # Core bot logic
-│ ├── modules/
-│ │ ├── stt.py # Speech-to-text logic
-│ │ ├── tts.py # Text-to-speech logic
-│ │ ├── rag.py # Vector search (RAG)
-│ │ └── nlp_core.py # LLM interface
+│   ├── prototype_text_only_bot.py   # Core chatbot logic (text-only)
+│   └── modules/
+│       ├── stt.py                # Speech-to-text (STT) processing
+│       ├── tts.py                # Text-to-speech (TTS) generation
+│       ├── rag.py                # Retrieval-Augmented Generation (RAG) logic
+│       └── nlp_core.py           # NLP/LLM interface (e.g., OpenAI, Gemini)
 ├── data/
-│ ├── processed/
-│ │ ├── conversation_script.json
-│ │ ├── knowledge_base.json
-│ │ └── customer_policy_data.json
-├── logs/ # Conversation log files
-├── requirements.txt
-├── README.md
-├── prompt.txt
-
+│   └── processed/
+│       ├── conversation_script.json     # Pre-defined scripted dialogs
+│       ├── knowledge_base.json          # Core knowledge base for RAG
+│       └── customer_policy_data.json    # Domain-specific data (e.g., policies)
+├── logs/                        # Stores chat and error logs
+├── prompt.txt                   # Custom system prompt for LLM behavior
+├── requirements.txt             # Python dependencies
+└── README.md                    # Project documentation
 
 
 ---
